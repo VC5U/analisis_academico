@@ -3,10 +3,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_auc_score, roc_curve
 from sklearn.cluster import KMeans
 import plotly.express as px
 import plotly.graph_objects as go
@@ -27,10 +27,102 @@ st.markdown("""
 **Modelos Supervisado y No Supervisado** para predecir y entender el rendimiento estudiantil
 """)
 
-# Sidebar para navegación
+# ============================================================================
+# FUNCIONES PARA CARGAR Y PREPARAR DATOS
+# ============================================================================
+@st.cache_data
+def cargar_datos():
+    """Cargar dataset y entender su estructura"""
+    try:
+        df = pd.read_csv('academic_performance_master.csv')
+        
+        # Información básica para debug
+        st.session_state['dataset_info'] = {
+            'filas': df.shape[0],
+            'columnas': df.shape[1],
+            'columnas_lista': df.columns.tolist()
+        }
+        
+        return df
+    except Exception as e:
+        st.error(f"❌ Error al cargar dataset: {str(e)}")
+        return None
+
+@st.cache_data
+def preparar_datos_para_modelos(df, limite_aprobacion=7.0):
+    """Preparar datos para modelos ML"""
+    df_clean = df.copy()
+    
+    # 1. Manejar valores nulos
+    for col in df_clean.columns:
+        if df_clean[col].isnull().sum() > 0:
+            if df_clean[col].dtype == 'object':
+                df_clean[col].fillna('Desconocido', inplace=True)
+            else:
+                df_clean[col].fillna(df_clean[col].median(), inplace=True)
+    
+    # 2. Crear variable objetivo (APROBADO/REPROBADO)
+    if 'Nota_final' in df_clean.columns:
+        # Verificar escala de notas
+        nota_max = df_clean['Nota_final'].max()
+        
+        # Determinar escala (0-10 o 0-100)
+        if nota_max <= 10:
+            escala = "0-10"
+            if limite_aprobacion > 10:
+                limite_aprobacion = 7.0
+                st.sidebar.info(f"📝 Notas en escala 0-10. Límite ajustado a {limite_aprobacion}")
+        else:
+            escala = "0-100"
+        
+        df_clean['Aprobado'] = (df_clean['Nota_final'] >= limite_aprobacion).astype(int)
+        
+        # Estadísticas
+        aprobados = df_clean['Aprobado'].sum()
+        total = len(df_clean)
+        tasa_aprobacion = aprobados / total * 100
+        
+        return df_clean, 'Nota_final', limite_aprobacion, aprobados, total, tasa_aprobacion, escala
+    else:
+        st.error("❌ No se encontró columna 'Nota_final' en el dataset")
+        return None, None, None, None, None, None, None
+
+@st.cache_data
+def crear_features_adicionales(df):
+    """Crear características adicionales para mejorar modelos"""
+    df_features = df.copy()
+    
+    # Si hay múltiples registros por estudiante, podemos agregar
+    if 'Identificacion_Estudiante' in df.columns:
+        stats_estudiante = df.groupby('Identificacion_Estudiante').agg({
+            'Asistencia': 'mean',
+            'Nota_final': 'mean',
+            'Asignatura': 'count'
+        }).rename(columns={
+            'Asistencia': 'Asistencia_promedio',
+            'Nota_final': 'Nota_promedio',
+            'Asignatura': 'Num_asignaturas'
+        }).reset_index()
+        
+        df_features = df_features.merge(stats_estudiante, 
+                                      on='Identificacion_Estudiante', 
+                                      how='left')
+    
+    # Codificar variables categóricas importantes
+    categorical_cols = ['Nivel', 'Carrera']
+    for col in categorical_cols:
+        if col in df_features.columns:
+            le = LabelEncoder()
+            df_features[f'{col}_encoded'] = le.fit_transform(df_features[col].astype(str))
+    
+    return df_features
+
+# ============================================================================
+# SIDEBAR CONFIGURACIÓN
+# ============================================================================
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2232/2232688.png", width=100)
-    st.title("Navegación")
+    st.title("🔍 Navegación")
     
     section = st.radio(
         "Selecciona una sección:",
@@ -42,101 +134,106 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.markdown("### Configuración")
+    st.title("⚙️ Configuración")
+    
+    # Configuración general
+    usar_features_adicionales = st.checkbox("Usar características adicionales", value=True)
     
     if section == "🤖 Modelo Supervisado":
-        test_size = st.slider("Tamaño del conjunto de prueba:", 0.1, 0.5, 0.3, 0.05)
-        limite_aprobacion = st.slider("Límite para aprobar:", 50, 90, 70, 5)
+        st.subheader("Configuración Modelo")
+        test_size = st.slider("Tamaño conjunto prueba:", 0.1, 0.5, 0.3, 0.05)
+        
+        # Detectar escala de notas
+        df_loaded = cargar_datos()
+        if df_loaded is not None and 'Nota_final' in df_loaded.columns:
+            nota_max = df_loaded['Nota_final'].max()
+            if nota_max <= 10:
+                limite_default = 7.0
+                limite_min, limite_max, step = 0.0, 10.0, 0.5
+            else:
+                limite_default = 70.0
+                limite_min, limite_max, step = 0.0, 100.0, 5.0
+            
+            limite_aprobacion = st.slider("Límite para aprobar:", 
+                                         limite_min, limite_max, 
+                                         limite_default, step)
+        else:
+            limite_aprobacion = st.slider("Límite para aprobar:", 0.0, 100.0, 70.0, 5.0)
         
     elif section == "🔍 Modelo No Supervisado":
+        st.subheader("Configuración Clustering")
         n_clusters = st.slider("Número de clusters:", 2, 6, 3)
-        feature_x = st.selectbox("Variable X:", ["Asistencia", "Nota_final", "Tareas_entregadas"])
-        feature_y = st.selectbox("Variable Y:", ["Nota_final", "Asistencia", "Tareas_entregadas"])
-
-# Función para cargar y preparar datos
-@st.cache_data
-def cargar_y_preparar_datos(limite_aprobacion=70):
-    try:
-        df = pd.read_csv('academic_performance_master.csv')
-        
-        # Verificar columnas disponibles
-        st.sidebar.info(f"📊 Dataset: {df.shape[0]} filas, {df.shape[1]} columnas")
-        
-        # Mostrar columnas reales en debug
-        debug_cols = st.sidebar.checkbox("Mostrar columnas del dataset", value=False)
-        if debug_cols:
-            st.sidebar.write("Columnas disponibles:", list(df.columns))
-        
-        # Crear copia para limpieza
-        df_clean = df.copy()
-        
-        # Manejar valores nulos
-        for col in df_clean.columns:
-            if df_clean[col].isnull().sum() > 0:
-                if df_clean[col].dtype == 'object':
-                    df_clean[col].fillna('Desconocido', inplace=True)
-                else:
-                    df_clean[col].fillna(df_clean[col].median(), inplace=True)
-        
-        # Buscar columna de nota (puede tener diferentes nombres)
-        nota_cols = [col for col in df_clean.columns if 'nota' in col.lower() or 'Nota' in col]
-        if nota_cols:
-            nota_col = nota_cols[0]
-            st.sidebar.success(f"✅ Columna de nota encontrada: '{nota_col}'")
+    
+    st.markdown("---")
+    st.title("📊 Información del Dataset")
+    
+    # Cargar y mostrar información del dataset
+    df = cargar_datos()
+    
+    if df is not None:
+        # Filtrar carreras no deseadas
+        if 'Carrera' in df.columns:
+            # Contar antes de filtrar
+            total_antes = len(df)
             
-            # Crear variable objetivo
-            df_clean['Aprobado'] = (df_clean[nota_col] >= limite_aprobacion).astype(int)
+            # Filtrar carreras no deseadas
+            mascara_carreras = df['Carrera'].astype(str).str.startswith(('PREPARAREC', 'NT', 'CENTRO DE IDIOM'))
+            df = df[~mascara_carreras].copy()
             
-            # Verificar distribución de clases
-            aprobados = df_clean['Aprobado'].sum()
-            total = len(df_clean)
-            st.sidebar.info(f"📊 Distribución: {aprobados} aprobados ({aprobados/total*100:.1f}%)")
+            total_despues = len(df)
+            eliminados = total_antes - total_despues
             
-            if aprobados == 0 or aprobados == total:
-                st.sidebar.warning(f"⚠️ Solo hay una clase en los datos. Ajusta el límite de aprobación.")
-                
+            if eliminados > 0:
+                st.success(f"✅ Dataset filtrado: {total_despues:,} registros")
+                st.info(f"🗑️ Se eliminaron {eliminados:,} registros de carreras no deseadas")
+            else:
+                st.success(f"✅ Dataset: {total_despues:,} registros")
         else:
-            st.sidebar.error("❌ No se encontró columna de nota en el dataset")
-            # Crear variable objetivo ficticia para continuar
-            df_clean['Aprobado'] = np.random.choice([0, 1], size=len(df_clean), p=[0.3, 0.7])
+            st.success(f"✅ Dataset: {len(df):,} registros")
         
-        return df, df_clean
-        
-    except Exception as e:
-        st.sidebar.error(f"❌ Error al cargar datos: {str(e)}")
-        
-        # Crear datos de ejemplo
-        np.random.seed(42)
-        n_estudiantes = 200
-        
-        datos = {
-            'Estudiante': [f'EST{i:03d}' for i in range(n_estudiantes)],
-            'Nombre': [f'Estudiante_{i}' for i in range(n_estudiantes)],
-            'Asistencia': np.random.normal(85, 10, n_estudiantes).clip(60, 100).astype(int),
-            'Tareas_entregadas': np.random.randint(5, 20, n_estudiantes),
-            'Participacion_clase': np.random.normal(7, 2, n_estudiantes).clip(0, 10).astype(int),
-            'Horas_estudio': np.random.normal(12, 4, n_estudiantes).clip(2, 25).astype(int),
-            'Nota_parcial1': np.random.normal(75, 15, n_estudiantes).clip(30, 100).astype(int),
-            'Nota_parcial2': np.random.normal(72, 18, n_estudiantes).clip(30, 100).astype(int),
-            'Nota_final': np.random.normal(70, 20, n_estudiantes).clip(0, 100).astype(int),
-            'Nivel': np.random.choice(['Licenciatura', 'Maestría'], n_estudiantes, p=[0.8, 0.2])
-        }
-        
-        df = pd.DataFrame(datos)
-        df_clean = df.copy()
-        df_clean['Aprobado'] = (df_clean['Nota_final'] >= limite_aprobacion).astype(int)
-        
-        st.sidebar.warning("⚠️ Usando datos de ejemplo")
-        return df, df_clean
+        # Información básica
+        with st.expander("Ver detalles del dataset"):
+            st.write("**Columnas disponibles:**")
+            st.write(df.columns.tolist())
+            
+            if 'Nota_final' in df.columns:
+                st.write("**Estadísticas de Nota_final:**")
+                st.write(df['Nota_final'].describe())
+                
+                # Detectar escala
+                nota_max = df['Nota_final'].max()
+                if nota_max <= 10:
+                    st.info("📝 **Escala detectada:** 0-10")
+                else:
+                    st.info("📝 **Escala detectada:** 0-100")
+    else:
+        st.error("No se pudo cargar el dataset")
 
-# Cargar datos según la sección
-if section == "🤖 Modelo Supervisado":
-    limite = st.session_state.get('limite_aprobacion', 70)
-    if 'limite_aprobacion' in st.session_state:
-        limite = st.session_state.limite_aprobacion
-    df, df_clean = cargar_y_preparar_datos(limite)
+# ============================================================================
+# CARGAR Y PREPARAR DATOS
+# ============================================================================
+if 'df' not in locals() or df is None:
+    df = cargar_datos()
+
+if df is not None:
+    # Aplicar filtro de carreras
+    if 'Carrera' in df.columns:
+        df = df[~df['Carrera'].astype(str).str.startswith(('PREPARAREC', 'NT', 'CENTRO DE IDIOM'))].copy()
+    
+    # Preparar datos según configuración
+    if section == "🤖 Modelo Supervisado":
+        df_clean, nota_col, limite, aprobados, total, tasa, escala = preparar_datos_para_modelos(
+            df, limite_aprobacion if 'limite_aprobacion' in locals() else 7.0
+        )
+    else:
+        df_clean, nota_col, limite, aprobados, total, tasa, escala = preparar_datos_para_modelos(df, 7.0)
+    
+    # Crear características adicionales si está habilitado
+    if usar_features_adicionales and df_clean is not None:
+        df_clean = crear_features_adicionales(df_clean)
 else:
-    df, df_clean = cargar_y_preparar_datos()
+    st.error("❌ No se pudo cargar el dataset")
+    st.stop()
 
 # ============================================================================
 # SECCIÓN 1: EXPLORACIÓN DE DATOS
@@ -144,126 +241,178 @@ else:
 if section == "📊 Exploración de Datos":
     st.header("📊 Exploración del Dataset")
     
-    # Pestañas
-    tab1, tab2, tab3 = st.tabs(["📋 Vista General", "📈 Análisis", "🔍 Calidad"])
-    
-    with tab1:
-        col1, col2 = st.columns([2, 1])
+    if df is not None:
+        # Pestañas
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 Vista General", "📈 Análisis Estadístico", 
+                                          "🎓 Análisis Académico", "🔍 Calidad de Datos"])
         
-        with col1:
-            st.subheader("Primeros registros")
-            st.dataframe(df.head(10), use_container_width=True, height=300)
+        with tab1:
+            col1, col2 = st.columns([2, 1])
             
-            st.subheader("Últimos registros")
-            st.dataframe(df.tail(5), use_container_width=True, height=200)
+            with col1:
+                st.subheader("Primeros registros")
+                st.dataframe(df.head(10), use_container_width=True, height=350)
+                
+                st.subheader("Resumen por estudiante")
+                if 'Identificacion_Estudiante' in df.columns:
+                    estudiantes_unicos = df['Identificacion_Estudiante'].nunique()
+                    asignaturas_por_est = df.groupby('Identificacion_Estudiante')['Asignatura'].count()
+                    
+                    col_est1, col_est2, col_est3 = st.columns(3)
+                    with col_est1:
+                        st.metric("Estudiantes únicos", estudiantes_unicos)
+                    with col_est2:
+                        st.metric("Registros totales", len(df))
+                    with col_est3:
+                        st.metric("Prom. asignaturas/est", f"{asignaturas_por_est.mean():.1f}")
+            
+            with col2:
+                st.subheader("Información General")
+                st.metric("Total Registros", len(df))
+                st.metric("Total Columnas", len(df.columns))
+                
+                if 'Nota_final' in df.columns:
+                    nota_prom = df['Nota_final'].mean()
+                    st.metric("Nota Promedio", f"{nota_prom:.2f}")
+                    
+                    # Distribución de estados
+                    if 'Estado_Asignatura' in df.columns:
+                        estados = df['Estado_Asignatura'].value_counts()
+                        st.write("**Estado de Asignaturas:**")
+                        for estado, count in estados.items():
+                            porcentaje = count/len(df)*100
+                            st.write(f"- {estado}: {count} ({porcentaje:.1f}%)")
         
-        with col2:
-            st.subheader("Información general")
-            st.metric("Total de estudiantes", len(df))
-            st.metric("Variables", len(df.columns))
+        with tab2:
+            col1, col2 = st.columns(2)
             
-            if 'Aprobado' in df_clean.columns:
-                aprobados = df_clean['Aprobado'].sum()
-                total = len(df_clean)
-                st.metric("Estudiantes que aprueban", aprobados)
-                st.metric("Tasa de aprobación", f"{aprobados/total*100:.1f}%")
+            with col1:
+                # Histograma de notas
+                if 'Nota_final' in df.columns:
+                    fig_notas = px.histogram(df, x='Nota_final', nbins=30,
+                                            title='Distribución de Notas Finales',
+                                            color_discrete_sequence=['#636EFA'])
+                    fig_notas.update_layout(xaxis_title="Nota Final", yaxis_title="Frecuencia")
+                    st.plotly_chart(fig_notas, use_container_width=True)
+                    
+                    # Estadísticas
+                    st.subheader("Estadísticas de Notas")
+                    stats_df = df['Nota_final'].describe()
+                    st.dataframe(pd.DataFrame(stats_df).T, use_container_width=True)
             
-            # Mostrar tipos de datos
-            st.subheader("Tipos de datos")
-            tipos = pd.DataFrame(df.dtypes, columns=['Tipo'])
-            st.dataframe(tipos, use_container_width=True)
-    
-    with tab2:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Buscar columna numérica para histograma
+            with col2:
+                # Boxplot de asistencia
+                if 'Asistencia' in df.columns:
+                    fig_asist = px.box(df, y='Asistencia', 
+                                      title='Distribución de Asistencia',
+                                      color_discrete_sequence=['#00CC96'])
+                    st.plotly_chart(fig_asist, use_container_width=True)
+                    
+                    # Relación asistencia-nota (SIN trendline para evitar error)
+                    if 'Nota_final' in df.columns:
+                        fig_rel = px.scatter(df, x='Asistencia', y='Nota_final',
+                                           title='Relación: Asistencia vs Nota Final',
+                                           opacity=0.6,
+                                           trendline=None)  # Sin trendline
+                        st.plotly_chart(fig_rel, use_container_width=True)
+                        
+                        # Calcular correlación manualmente
+                        correlacion = df['Asistencia'].corr(df['Nota_final'])
+                        st.info(f"**Correlación Asistencia-Nota:** {correlacion:.3f}")
+            
+            # Matriz de correlación
+            st.subheader("Matriz de Correlación")
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             
-            if len(numeric_cols) > 0:
-                col_selected = st.selectbox("Selecciona variable para histograma:", numeric_cols)
+            if len(numeric_cols) > 1:
+                corr_matrix = df[numeric_cols].corr()
                 
-                fig = px.histogram(df, x=col_selected, nbins=30,
-                                  title=f'Distribución de {col_selected}',
-                                  color_discrete_sequence=['#636EFA'])
-                fig.update_layout(xaxis_title=col_selected, yaxis_title="Frecuencia")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("No hay columnas numéricas para analizar")
+                fig_corr = px.imshow(corr_matrix, 
+                                    text_auto='.2f',
+                                    aspect="auto",
+                                    color_continuous_scale='RdBu',
+                                    title='Correlación entre Variables Numéricas')
+                st.plotly_chart(fig_corr, use_container_width=True)
         
-        with col2:
-            # Boxplot
-            if len(numeric_cols) > 0:
-                col_box = st.selectbox("Selecciona variable para boxplot:", numeric_cols, 
-                                      key='boxplot_select')
-                
-                fig = px.box(df, y=col_box, 
-                            title=f'Boxplot de {col_box}',
-                            color_discrete_sequence=['#00CC96'])
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # Matriz de correlación
-        st.subheader("Matriz de Correlación")
-        
-        if len(numeric_cols) > 1:
-            corr_matrix = df[numeric_cols].corr()
+        with tab3:
+            st.subheader("🎓 Análisis Académico Detallado")
             
-            fig = px.imshow(corr_matrix, 
-                           text_auto='.2f',
-                           aspect="auto",
-                           color_continuous_scale='RdBu',
-                           title='Correlación entre variables')
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Top correlaciones
-            st.subheader("Correlaciones más fuertes")
-            if 'Nota_final' in corr_matrix.columns:
-                correlaciones = corr_matrix['Nota_final'].abs().sort_values(ascending=False)
-                correlaciones = correlaciones[correlaciones.index != 'Nota_final']
+            # Análisis por carrera
+            if 'Carrera' in df.columns:
+                st.write("**Desempeño por Carrera (Top 15):**")
+                carrera_stats = df.groupby('Carrera').agg({
+                    'Nota_final': ['mean', 'count'],
+                    'Asistencia': 'mean'
+                }).round(2)
                 
-                top_corr = correlaciones.head(5)
-                st.write(top_corr)
+                carrera_stats.columns = ['Nota_promedio', 'Num_registros', 'Asistencia_promedio']
+                
+                # Ordenar y mostrar
+                carrera_stats = carrera_stats.sort_values('Nota_promedio', ascending=False).head(15)
+                st.dataframe(carrera_stats, use_container_width=True)
+                
+                # Gráfico de barras por carrera
+                fig_carrera = px.bar(carrera_stats.reset_index(),
+                                    x='Carrera', y='Nota_promedio',
+                                    title='Top 15 Carreras por Nota Promedio',
+                                    color='Nota_promedio',
+                                    color_continuous_scale='Viridis')
+                fig_carrera.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig_carrera, use_container_width=True)
+            
+            # Análisis por nivel
+            if 'Nivel' in df.columns:
+                st.write("**Desempeño por Nivel Académico:**")
+                nivel_stats = df.groupby('Nivel').agg({
+                    'Nota_final': 'mean',
+                    'Asistencia': 'mean',
+                    'Identificacion_Estudiante': 'nunique'
+                }).round(2)
+                
+                nivel_stats.columns = ['Nota_promedio', 'Asistencia_promedio', 'Estudiantes_unicos']
+                st.dataframe(nivel_stats, use_container_width=True)
+        
+        with tab4:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Valores nulos
+                st.subheader("Valores Nulos")
+                null_counts = df.isnull().sum()
+                null_df = pd.DataFrame({
+                    'Columna': null_counts.index,
+                    'Valores Nulos': null_counts.values,
+                    '% Nulos': (null_counts.values / len(df) * 100).round(2)
+                })
+                null_df = null_df[null_df['Valores Nulos'] > 0]
+                
+                if len(null_df) > 0:
+                    st.dataframe(null_df, use_container_width=True)
+                    st.warning(f"⚠️ {len(null_df)} columnas tienen valores nulos")
+                else:
+                    st.success("✅ No hay valores nulos")
+            
+            with col2:
+                # Duplicados
+                st.subheader("Registros Duplicados")
+                dup_count = df.duplicated().sum()
+                
+                if dup_count > 0:
+                    st.error(f"❌ {dup_count} registros duplicados")
+                else:
+                    st.success("✅ No hay duplicados")
+                
+                # Valores únicos
+                st.subheader("Valores Únicos por Columna")
+                unique_counts = df.nunique()
+                unique_df = pd.DataFrame({
+                    'Columna': unique_counts.index,
+                    'Valores Únicos': unique_counts.values
+                }).sort_values('Valores Únicos', ascending=False).head(10)
+                st.dataframe(unique_df, use_container_width=True)
     
-    with tab3:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Valores nulos
-            st.subheader("Valores Nulos")
-            null_counts = df.isnull().sum()
-            null_df = pd.DataFrame({
-                'Variable': null_counts.index,
-                'Valores nulos': null_counts.values,
-                '% Nulos': (null_counts.values / len(df) * 100).round(2)
-            })
-            null_df = null_df[null_df['Valores nulos'] > 0]
-            
-            if len(null_df) > 0:
-                st.dataframe(null_df, use_container_width=True)
-            else:
-                st.success("✅ No hay valores nulos")
-        
-        with col2:
-            # Duplicados
-            st.subheader("Registros Duplicados")
-            dup_count = df.duplicated().sum()
-            if dup_count > 0:
-                st.warning(f"⚠️ {dup_count} registros duplicados encontrados")
-                
-                if st.button("Mostrar duplicados"):
-                    duplicates = df[df.duplicated(keep=False)]
-                    st.dataframe(duplicates, use_container_width=True)
-            else:
-                st.success("✅ No hay registros duplicados")
-            
-            # Valores únicos
-            st.subheader("Valores Únicos por Columna")
-            unique_counts = df.nunique()
-            unique_df = pd.DataFrame({
-                'Variable': unique_counts.index,
-                'Valores únicos': unique_counts.values
-            })
-            st.dataframe(unique_df.head(10), use_container_width=True)
+    else:
+        st.error("No hay datos para mostrar")
 
 # ============================================================================
 # SECCIÓN 2: MODELO SUPERVISADO
@@ -271,149 +420,161 @@ if section == "📊 Exploración de Datos":
 elif section == "🤖 Modelo Supervisado":
     st.header("🤖 Modelo de Clasificación Supervisada")
     
-    # Actualizar límite en sesión
-    st.session_state.limite_aprobacion = limite_aprobacion
-    
-    # Recargar datos con nuevo límite
-    df, df_clean = cargar_y_preparar_datos(limite_aprobacion)
-    
-    # Verificar que tenemos ambas clases
-    if 'Aprobado' not in df_clean.columns:
-        st.error("No se pudo crear la variable objetivo 'Aprobado'")
-        st.stop()
-    
-    clase_counts = df_clean['Aprobado'].value_counts()
-    if len(clase_counts) < 2:
-        st.warning(f"""
-        ⚠️ **Problema**: Solo hay una clase en los datos ({clase_counts.index[0]})
-        
-        **Causas posibles:**
-        1. El límite de aprobación ({limite_aprobacion}) es muy alto/bajo
-        2. Todos los estudiantes tienen notas similares
-        3. El dataset tiene un desbalance extremo
-        
-        **Solución:**
-        - Ajusta el límite de aprobación en la barra lateral
-        - O usa datos de ejemplo (selecciona en barra lateral)
+    if df_clean is not None:
+        # Mostrar información
+        st.info(f"""
+        **📊 Información del Dataset Preparado:**
+        - Total registros: {total:,}
+        - Aprobados: {aprobados:,} ({tasa:.1f}%)
+        - Límite de aprobación: {limite}
+        - Escala de notas: {escala}
         """)
         
-        # Mostrar estadísticas de notas
-        nota_cols = [col for col in df_clean.columns if 'nota' in col.lower() or 'Nota' in col]
-        if nota_cols:
-            st.subheader("Estadísticas de Notas")
-            nota_col = nota_cols[0]
-            st.write(f"Columna de nota: {nota_col}")
-            st.write(df_clean[nota_col].describe())
-        
-        st.stop()
-    
-    # Preparar datos para modelo
-    st.subheader("Preparación de Datos")
-    
-    # Seleccionar características numéricas
-    numeric_features = df_clean.select_dtypes(include=[np.number]).columns.tolist()
-    
-    # Excluir columnas no relevantes
-    exclude_features = ['Aprobado']
-    for col in df_clean.columns:
-        if 'nota' in col.lower() or 'Nota' in col:
-            exclude_features.append(col)
-    
-    features = [col for col in numeric_features if col not in exclude_features]
-    
-    if len(features) == 0:
-        st.error("No hay características numéricas para entrenar el modelo")
-        st.stop()
-    
-    st.write(f"**Características seleccionadas:** {len(features)} variables")
-    st.write(features)
-    
-    X = df_clean[features]
-    y = df_clean['Aprobado']
-    
-    # Mostrar distribución de clases
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total muestras", len(X))
-    with col2:
-        st.metric("Clase 0 (Reprobados)", (y == 0).sum())
-    with col3:
-        st.metric("Clase 1 (Aprobados)", (y == 1).sum())
-    
-    # Estandarizar y dividir
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=test_size, random_state=42, stratify=y
-    )
-    
-    # Entrenar modelo
-    st.subheader("Entrenamiento del Modelo")
-    
-    try:
-        model = LogisticRegression(random_state=42, max_iter=1000)
-        model.fit(X_train, y_train)
-        
-        # Predicciones y métricas
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        conf_matrix = confusion_matrix(y_test, y_pred)
-        
-        # Mostrar resultados
-        st.success(f"✅ Modelo entrenado exitosamente")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Accuracy", f"{accuracy:.2%}")
-        
-        with col2:
-            precision = conf_matrix[1,1] / (conf_matrix[1,1] + conf_matrix[0,1]) if (conf_matrix[1,1] + conf_matrix[0,1]) > 0 else 0
-            st.metric("Precisión", f"{precision:.2%}")
-        
-        with col3:
-            recall = conf_matrix[1,1] / (conf_matrix[1,1] + conf_matrix[1,0]) if (conf_matrix[1,1] + conf_matrix[1,0]) > 0 else 0
-            st.metric("Recall", f"{recall:.2%}")
-        
-        # Matriz de confusión
-        st.subheader("Matriz de Confusión")
-        fig = px.imshow(conf_matrix,
-                       text_auto=True,
-                       color_continuous_scale='Blues',
-                       labels=dict(x="Predicción", y="Real", color="Cantidad"),
-                       x=['Reprobado', 'Aprobado'],
-                       y=['Reprobado', 'Aprobado'],
-                       title=f'Accuracy: {accuracy:.2%}')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Reporte
-        st.subheader("Reporte de Clasificación")
-        report = classification_report(y_test, y_pred, output_dict=True)
-        report_df = pd.DataFrame(report).transpose()
-        st.dataframe(report_df, use_container_width=True)
-        
-        # Importancia de características
-        st.subheader("Importancia de Características")
-        if hasattr(model, 'coef_'):
-            importance = pd.DataFrame({
-                'Variable': features,
-                'Importancia': np.abs(model.coef_[0])
-            }).sort_values('Importancia', ascending=False)
+        # Verificar que tenemos ambas clases
+        if df_clean['Aprobado'].nunique() < 2:
+            st.error(f"""
+            ⚠️ **PROBLEMA**: Solo hay una clase en los datos
             
-            fig = px.bar(importance, 
-                        x='Importancia', 
-                        y='Variable',
-                        orientation='h',
-                        title='Importancia de Variables',
-                        color='Importancia',
-                        color_continuous_scale='Viridis')
-            st.plotly_chart(fig, use_container_width=True)
+            **Solución:**
+            1. Ajusta el límite de aprobación en la barra lateral
+            2. Actualmente usando límite: {limite}
+            3. Rango de notas: {df_clean['Nota_final'].min():.1f} - {df_clean['Nota_final'].max():.1f}
+            """)
             
-            st.dataframe(importance, use_container_width=True)
-    
-    except Exception as e:
-        st.error(f"❌ Error al entrenar modelo: {str(e)}")
+            # Mostrar distribución de notas
+            fig_dist = px.histogram(df_clean, x='Nota_final', nbins=30,
+                                   title=f'Distribución de Notas (Límite: {limite})',
+                                   color_discrete_sequence=['#FF6B6B'])
+            fig_dist.add_vline(x=limite, line_dash="dash", line_color="green",
+                              annotation_text=f"Límite: {limite}")
+            st.plotly_chart(fig_dist, use_container_width=True)
+            st.stop()
+        
+        # Preparar características
+        st.subheader("🎯 Selección de Características")
+        
+        numeric_features = df_clean.select_dtypes(include=[np.number]).columns.tolist()
+        exclude_features = ['Aprobado', 'Nota_final']
+        if 'Nota_promedio' in numeric_features:
+            exclude_features.append('Nota_promedio')
+        
+        features = [col for col in numeric_features if col not in exclude_features]
+        
+        if len(features) == 0:
+            st.error("No hay características numéricas disponibles")
+            st.stop()
+        
+        st.success(f"✅ {len(features)} características seleccionadas")
+        
+        # Dividir datos
+        X = df_clean[features]
+        y = df_clean['Aprobado']
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y
+        )
+        
+        # Estandarizar
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Entrenar modelo
+        st.subheader("🚀 Entrenamiento del Modelo")
+        
+        with st.spinner("Entrenando modelo..."):
+            try:
+                model = LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced')
+                model.fit(X_train_scaled, y_train)
+                
+                # Predicciones
+                y_pred = model.predict(X_test_scaled)
+                y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+                
+                # Métricas
+                accuracy = accuracy_score(y_test, y_pred)
+                conf_matrix = confusion_matrix(y_test, y_pred)
+                roc_auc = roc_auc_score(y_test, y_pred_proba)
+                
+                st.success("✅ Modelo entrenado exitosamente!")
+                
+                # Mostrar métricas
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Accuracy", f"{accuracy:.2%}")
+                
+                with col2:
+                    precision = conf_matrix[1,1] / (conf_matrix[1,1] + conf_matrix[0,1]) if (conf_matrix[1,1] + conf_matrix[0,1]) > 0 else 0
+                    st.metric("Precisión", f"{precision:.2%}")
+                
+                with col3:
+                    recall = conf_matrix[1,1] / (conf_matrix[1,1] + conf_matrix[1,0]) if (conf_matrix[1,1] + conf_matrix[1,0]) > 0 else 0
+                    st.metric("Recall", f"{recall:.2%}")
+                
+                with col4:
+                    st.metric("ROC-AUC", f"{roc_auc:.3f}")
+                
+                # Matriz de confusión
+                st.subheader("📊 Matriz de Confusión")
+                
+                fig_cm = px.imshow(conf_matrix,
+                                  text_auto=True,
+                                  color_continuous_scale='Blues',
+                                  labels=dict(x="Predicción", y="Real", color="Cantidad"),
+                                  x=['Reprobado', 'Aprobado'],
+                                  y=['Reprobado', 'Aprobado'],
+                                  title=f'Accuracy: {accuracy:.2%}')
+                st.plotly_chart(fig_cm, use_container_width=True)
+                
+                # Reporte
+                st.subheader("📋 Reporte de Clasificación")
+                report = classification_report(y_test, y_pred, output_dict=True)
+                report_df = pd.DataFrame(report).transpose()
+                st.dataframe(report_df, use_container_width=True)
+                
+                # Importancia de características
+                st.subheader("🔝 Importancia de Características")
+                
+                if hasattr(model, 'coef_'):
+                    importance = pd.DataFrame({
+                        'Característica': features,
+                        'Importancia': np.abs(model.coef_[0])
+                    }).sort_values('Importancia', ascending=False)
+                    
+                    fig_imp = px.bar(importance.head(15), 
+                                    x='Importancia', 
+                                    y='Característica',
+                                    orientation='h',
+                                    title='Top 15 Características Más Importantes',
+                                    color='Importancia',
+                                    color_continuous_scale='Viridis')
+                    st.plotly_chart(fig_imp, use_container_width=True)
+                    
+                    st.dataframe(importance, use_container_width=True)
+                
+                # Curva ROC
+                st.subheader("📈 Curva ROC")
+                
+                fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+                
+                fig_roc = go.Figure()
+                fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', 
+                                            name=f'ROC (AUC = {roc_auc:.3f})',
+                                            line=dict(color='blue', width=2)))
+                fig_roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines',
+                                            name='Línea base', line=dict(dash='dash', color='gray')))
+                
+                fig_roc.update_layout(title='Curva ROC',
+                                     xaxis_title='Tasa de Falsos Positivos',
+                                     yaxis_title='Tasa de Verdaderos Positivos')
+                
+                st.plotly_chart(fig_roc, use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"❌ Error al entrenar modelo: {str(e)}")
+    else:
+        st.error("No hay datos preparados para el modelo")
 
 # ============================================================================
 # SECCIÓN 3: MODELO NO SUPERVISADO
@@ -421,164 +582,132 @@ elif section == "🤖 Modelo Supervisado":
 elif section == "🔍 Modelo No Supervisado":
     st.header("🔍 Clustering de Estudiantes")
     
-    # Verificar características disponibles
-    available_features = [col for col in ['Asistencia', 'Nota_final', 'Tareas_entregadas'] 
-                         if col in df_clean.columns]
-    
-    if len(available_features) < 2:
-        # Usar primeras columnas numéricas
-        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
-        available_features = numeric_cols[:min(3, len(numeric_cols))]
-        st.warning(f"Usando características disponibles: {available_features}")
-    
-    if len(available_features) < 2:
-        st.error("Se necesitan al menos 2 características numéricas para clustering")
-        st.stop()
-    
-    # Verificar que las características seleccionadas existan
-    if feature_x not in available_features:
-        feature_x = available_features[0]
-    if feature_y not in available_features:
-        feature_y = available_features[1] if len(available_features) > 1 else available_features[0]
-    
-    # Seleccionar datos para clustering
-    cluster_features = list(set([feature_x, feature_y]))
-    X_cluster = df_clean[cluster_features].copy()
-    
-    # Eliminar valores nulos
-    X_cluster = X_cluster.dropna()
-    
-    if len(X_cluster) < n_clusters:
-        st.error(f"No hay suficientes datos ({len(X_cluster)}) para {n_clusters} clusters")
-        st.stop()
-    
-    # Aplicar K-means
-    scaler_cluster = StandardScaler()
-    X_cluster_scaled = scaler_cluster.fit_transform(X_cluster)
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(X_cluster_scaled)
-    
-    df_clustered = df_clean.copy()
-    # Asegurar que los índices coincidan
-    df_clustered = df_clustered.loc[X_cluster.index].copy()
-    df_clustered['Cluster'] = clusters
-    
-    # Método del codo
-    st.subheader("Método del Codo para Determinar K Óptimo")
-    inertias = []
-    k_range = range(1, 11)
-    
-    for k in k_range:
-        kmeans_temp = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans_temp.fit(X_cluster_scaled)
-        inertias.append(kmeans_temp.inertia_)
-    
-    fig1 = px.line(x=list(k_range), y=inertias, 
-                  title='Método del Codo',
-                  labels={'x': 'Número de Clusters', 'y': 'Inercia'},
-                  markers=True)
-    fig1.add_vline(x=n_clusters, line_dash="dash", line_color="red",
-                  annotation_text=f"K seleccionado = {n_clusters}")
-    st.plotly_chart(fig1, use_container_width=True)
-    
-    # Visualización de clusters
-    st.subheader(f"Visualización de Clusters ({n_clusters} grupos)")
-    
-    # Preparar hover data
-    hover_columns = []
-    for col in df_clustered.columns:
-        if col not in cluster_features + ['Cluster']:
-            # Tomar solo algunas columnas para hover
-            if len(hover_columns) < 3:  # Máximo 3 columnas adicionales
-                hover_columns.append(col)
-    
-    fig2 = px.scatter(df_clustered, 
-                     x=feature_x,
-                     y=feature_y,
-                     color='Cluster',
-                     title=f'Clustering: {feature_x} vs {feature_y}',
-                     hover_data=hover_columns[:3],  # Limitar a 3 columnas
-                     color_continuous_scale='viridis')
-    
-    # Añadir centroides
-    centroids_descaled = scaler_cluster.inverse_transform(kmeans.cluster_centers_)
-    centroids_df = pd.DataFrame(centroids_descaled, columns=cluster_features)
-    centroids_df['Cluster'] = range(n_clusters)
-    
-    fig2.add_trace(go.Scatter(
-        x=centroids_df[feature_x],
-        y=centroids_df[feature_y],
-        mode='markers',
-        marker=dict(symbol='x', size=15, color='red', line=dict(width=2)),
-        name='Centroides',
-        hoverinfo='skip'
-    ))
-    
-    st.plotly_chart(fig2, use_container_width=True)
-    
-    # Estadísticas por cluster
-    st.subheader("Estadísticas por Cluster")
-    
-    # Seleccionar columnas para estadísticas
-    stats_cols = cluster_features.copy()
-    if 'Aprobado' in df_clustered.columns:
-        stats_cols.append('Aprobado')
-    
-    cluster_stats = df_clustered.groupby('Cluster')[stats_cols].agg(['mean', 'std', 'count']).round(2)
-    
-    # Formatear mejor la tabla
-    cluster_stats_flat = pd.DataFrame()
-    for col in stats_cols:
-        for stat in ['mean', 'std']:
-            if (col, stat) in cluster_stats.columns:
-                cluster_stats_flat[f'{col}_{stat}'] = cluster_stats[(col, stat)]
-    
-    st.dataframe(cluster_stats_flat, use_container_width=True)
-    
-    # Distribución de clusters
-    st.subheader("Distribución de Estudiantes por Cluster")
-    cluster_counts = df_clustered['Cluster'].value_counts().sort_index()
-    
-    fig3 = px.bar(x=cluster_counts.index.astype(str), 
-                  y=cluster_counts.values,
-                  title='Número de Estudiantes por Cluster',
-                  labels={'x': 'Cluster', 'y': 'Cantidad de Estudiantes'},
-                  color=cluster_counts.index.astype(str))
-    st.plotly_chart(fig3, use_container_width=True)
-    
-    # Interpretación
-    st.subheader("Interpretación de Clusters")
-    
-    for cluster_id in range(n_clusters):
-        with st.expander(f"Cluster {cluster_id} - {cluster_counts.get(cluster_id, 0)} estudiantes"):
-            cluster_data = df_clustered[df_clustered['Cluster'] == cluster_id]
+    if df_clean is not None:
+        st.info(f"📊 Dataset: {len(df_clean):,} registros")
+        
+        # Seleccionar características para clustering
+        available_features = ['Asistencia', 'Nota_final']
+        X_cluster = df_clean[available_features].copy()
+        X_cluster = X_cluster.dropna()
+        
+        if len(X_cluster) < n_clusters:
+            st.error(f"No hay suficientes datos ({len(X_cluster)}) para {n_clusters} clusters")
+            st.stop()
+        
+        # Método del codo
+        st.subheader("📉 Método del Codo")
+        
+        inertias = []
+        k_range = range(1, 11)
+        
+        for k in k_range:
+            kmeans_temp = KMeans(n_clusters=k, random_state=42, n_init=10)
+            kmeans_temp.fit(X_cluster)
+            inertias.append(kmeans_temp.inertia_)
+        
+        fig_elbow = px.line(x=list(k_range), y=inertias,
+                           title='Método del Codo - Inercia vs Número de Clusters',
+                           labels={'x': 'Número de Clusters (K)', 'y': 'Inercia'},
+                           markers=True)
+        fig_elbow.add_vline(x=n_clusters, line_dash="dash", line_color="red",
+                           annotation_text=f"K seleccionado = {n_clusters}")
+        st.plotly_chart(fig_elbow, use_container_width=True)
+        
+        # Aplicar K-means
+        st.subheader(f"🎨 Visualización de Clusters (K={n_clusters})")
+        
+        with st.spinner(f"Aplicando K-means..."):
+            scaler_cluster = StandardScaler()
+            X_cluster_scaled = scaler_cluster.fit_transform(X_cluster)
             
-            col1, col2 = st.columns(2)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            clusters = kmeans.fit_predict(X_cluster_scaled)
             
-            with col1:
-                st.write("**Características promedio:**")
-                for feature in stats_cols[:3]:  # Mostrar primeras 3
-                    if feature in cluster_data.columns:
-                        avg = cluster_data[feature].mean()
-                        st.write(f"- {feature}: {avg:.2f}")
-            
-            with col2:
-                if 'Aprobado' in cluster_data.columns:
-                    aprob_rate = cluster_data['Aprobado'].mean() * 100
-                    st.metric("Tasa de Aprobación", f"{aprob_rate:.1f}%")
-            
-            # Determinar perfil
-            if 'Nota_final' in cluster_data.columns:
-                avg_grade = cluster_data['Nota_final'].mean()
-                if avg_grade >= 80:
-                    st.success("🎯 **Estudiantes Destacados**: Alto rendimiento académico")
-                elif avg_grade >= 70:
-                    st.info("📚 **Estudiantes Regulares**: Rendimiento satisfactorio")
-                elif avg_grade >= 60:
-                    st.warning("⚠️ **Estudiantes en Riesgo**: Requieren atención")
-                else:
-                    st.error("🚨 **Estudiantes Críticos**: Necesitan intervención inmediata")
+            df_viz = pd.DataFrame({
+                'Asistencia': X_cluster['Asistencia'],
+                'Nota_final': X_cluster['Nota_final'],
+                'Cluster': clusters
+            })
+        
+        # Gráfico de clusters
+        fig_clusters = px.scatter(df_viz, x='Asistencia', y='Nota_final',
+                                 color='Cluster', 
+                                 title='Clustering: Asistencia vs Nota Final',
+                                 color_continuous_scale='viridis',
+                                 opacity=0.7)
+        
+        # Añadir centroides
+        centroids_descaled = scaler_cluster.inverse_transform(kmeans.cluster_centers_)
+        centroids_df = pd.DataFrame(centroids_descaled, columns=available_features)
+        
+        fig_clusters.add_trace(go.Scatter(
+            x=centroids_df['Asistencia'],
+            y=centroids_df['Nota_final'],
+            mode='markers',
+            marker=dict(symbol='x', size=15, color='red', line=dict(width=2)),
+            name='Centroides'
+        ))
+        
+        st.plotly_chart(fig_clusters, use_container_width=True)
+        
+        # Estadísticas por cluster
+        st.subheader("📊 Estadísticas por Cluster")
+        
+        if 'Aprobado' in df_clean.columns:
+            df_viz = df_viz.merge(df_clean[['Aprobado']], left_index=True, right_index=True)
+            stats_cols = ['Asistencia', 'Nota_final', 'Aprobado']
+        else:
+            stats_cols = ['Asistencia', 'Nota_final']
+        
+        cluster_stats = df_viz.groupby('Cluster')[stats_cols].agg(['mean', 'std', 'count']).round(2)
+        
+        # Formatear tabla
+        stats_display = pd.DataFrame()
+        for col in stats_cols:
+            for stat in ['mean', 'std']:
+                if (col, stat) in cluster_stats.columns:
+                    stats_display[f'{col}_{stat}'] = cluster_stats[(col, stat)]
+        
+        st.dataframe(stats_display, use_container_width=True)
+        
+        # Interpretación
+        st.subheader("👥 Interpretación de Clusters")
+        
+        cluster_counts = df_viz['Cluster'].value_counts().sort_index()
+        
+        for cluster_id in range(n_clusters):
+            with st.expander(f"Cluster {cluster_id} - {cluster_counts.get(cluster_id, 0)} estudiantes"):
+                cluster_data = df_viz[df_viz['Cluster'] == cluster_id]
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**Características promedio:**")
+                    asist_prom = cluster_data['Asistencia'].mean()
+                    nota_prom = cluster_data['Nota_final'].mean()
+                    st.write(f"• **Asistencia**: {asist_prom:.1f}%")
+                    st.write(f"• **Nota final**: {nota_prom:.2f}")
+                
+                with col2:
+                    if 'Aprobado' in cluster_data.columns:
+                        aprob_rate = cluster_data['Aprobado'].mean() * 100
+                        st.metric("Tasa de Aprobación", f"{aprob_rate:.1f}%")
+                
+                # Determinar perfil
+                if 'Nota_final' in cluster_data.columns:
+                    nota_prom = cluster_data['Nota_final'].mean()
+                    
+                    if nota_prom >= 8.5:
+                        st.success("**🎯 PERFIL: EXCELENTES** - Alto rendimiento")
+                    elif nota_prom >= 7.0:
+                        st.info("**📚 PERFIL: BUENOS** - Rendimiento satisfactorio")
+                    elif nota_prom >= 6.0:
+                        st.warning("**⚠️ PERFIL: REGULARES** - Necesita mejora")
+                    else:
+                        st.error("**🚨 PERFIL: CRÍTICOS** - Intervención urgente")
+    
+    else:
+        st.error("No hay datos para clustering")
 
 # ============================================================================
 # SECCIÓN 4: COMPARACIÓN
@@ -589,41 +718,41 @@ elif section == "📈 Comparación":
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("🔮 Modelo Supervisado")
+        st.subheader("🤖 Modelo Supervisado")
         st.markdown("""
-        ### ✅ Ventajas:
-        - **Alta precisión predictiva** para clasificación
-        - **Interpretación directa** de variables importantes
+        ### ✅ **Fortalezas:**
+        - **Alta precisión predictiva** para clasificación binaria
+        - **Interpretación directa** de variables importantes  
         - **Probabilidades específicas** por estudiante
-        - **Útil para intervenciones tempranas** y personalizadas
+        - **Ideal para intervenciones** tempranas y personalizadas
         
-        ### ⚠️ Limitaciones:
-        - **Requiere datos etiquetados** previamente
-        - **Asume relación lineal** entre variables
-        - **Sensible a desbalance** de clases
-        - **Puede sobreajustarse** a datos históricos
+        ### ⚠️ **Limitaciones:**
+        - Requiere **datos etiquetados** previamente
+        - Asume **relación lineal** entre variables
+        - Sensible a **desbalance** de clases
+        - Puede **sobreajustarse** a patrones históricos
         
-        ### 🎯 Mejor uso:
+        ### 🎯 **Mejor uso:**
         **Predicción individualizada** de riesgo académico
         """)
     
     with col2:
         st.subheader("🔍 Modelo No Supervisado")
         st.markdown("""
-        ### ✅ Ventajas:
-        - **Descubre patrones ocultos** sin etiquetas previas
+        ### ✅ **Fortalezas:**
+        - **Descubre patrones ocultos** sin necesidad de etiquetas
         - **Identifica perfiles naturales** de estudiantes
-        - **Útil para segmentación** y personalización
-        - **Detecta outliers** y casos atípicos
+        - **Útil para segmentación** y personalización de estrategias
+        - **Detecta outliers** y casos atípicos automáticamente
         
-        ### ⚠️ Limitaciones:
+        ### ⚠️ **Limitaciones:**
         - **Difícil evaluación objetiva** de resultados
         - **Sensible a selección** de características
-        - **Requiere interpretación** experta
-        - **Necesita definir** número de clusters
+        - **Requiere interpretación** experta de clusters
+        - Necesita **definir número** de clusters manualmente
         
-        ### 🎯 Mejor uso:
-        **Segmentación para estrategias** pedagógicas diferenciadas
+        ### 🎯 **Mejor uso:**
+        **Segmentación estratégica** para pedagogía diferenciada
         """)
     
     st.markdown("---")
@@ -634,24 +763,18 @@ elif section == "📈 Comparación":
     st.info("""
     ### **Estrategia combinada para máxima efectividad:**
     
-    1. **Primero usar Clustering** para identificar grupos naturales de estudiantes
-    2. **Luego aplicar Clasificación** dentro de cada grupo para predecir riesgo específico
-    3. **Diseñar intervenciones personalizadas** según el grupo y riesgo predicho
+    1. **Primero usar Clustering** para identificar **grupos naturales** de estudiantes
+    2. **Luego aplicar Clasificación** dentro de cada grupo para **predecir riesgo específico**
+    3. **Diseñar intervenciones personalizadas** según el **grupo + riesgo predicho**
     
-    ### **Ejemplo de aplicación:**
+    ### **Ejemplo de aplicación práctica:**
     
     | Cluster | Perfil | Estrategia Recomendada |
     |---------|---------|-----------------------|
-    | 0 | 🎯 Destacados | Mentoría avanzada, oportunidades investigación |
-    | 1 | 📚 Regulares | Refuerzo en áreas específicas, seguimiento regular |
-    | 2 | ⚠️ En Riesgo | Tutorías intensivas, seguimiento cercano |
-    | 3 | 🚨 Críticos | Intervención inmediata, apoyo integral |
-    
-    ### **Beneficios:**
-    - **Mayor precisión**: Modelos específicos por grupo
-    - **Intervenciones efectivas**: Estrategias personalizadas
-    - **Uso eficiente de recursos**: Enfoque en quienes más lo necesitan
-    - **Prevención temprana**: Identificación proactiva de riesgo
+    | **0** | 🎯 **Destacados** | Mentoría avanzada, oportunidades investigación |
+    | **1** | 📚 **Regulares** | Refuerzo específico, seguimiento regular |
+    | **2** | ⚠️ **En Riesgo** | Tutorías intensivas, plan de mejora |
+    | **3** | 🚨 **Críticos** | Intervención inmediata, apoyo integral |
     """)
 
 # ============================================================================
@@ -660,181 +783,142 @@ elif section == "📈 Comparación":
 else:
     st.header("🔮 Predicción Individual")
     
-    # Verificar que tenemos datos con variable objetivo
-    if 'Aprobado' not in df_clean.columns:
-        st.error("No se puede realizar predicción - falta variable objetivo")
-        st.info("Ve a la sección 'Modelo Supervisado' primero para configurar el límite de aprobación")
-        st.stop()
-    
-    # Verificar que tenemos ambas clases
-    if df_clean['Aprobado'].nunique() < 2:
-        st.warning("No hay suficientes clases para entrenar modelo predictivo")
-        st.info("Ajusta el límite de aprobación en la sección 'Modelo Supervisado'")
-        st.stop()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Características del Estudiante")
-        
-        # Sliders con valores por defecto realistas
-        asistencia = st.slider("Asistencia (%)", 0, 100, 85)
-        tareas = st.slider("Tareas entregadas", 0, 30, 15)
-        participacion = st.slider("Participación (0-10)", 0, 10, 7)
-        horas_estudio = st.slider("Horas de estudio semanales", 0, 40, 12)
-        
-        # Botón para predecir
-        predecir = st.button("🔮 Predecir Resultado", type="primary")
-    
-    with col2:
-        # Preparar características para modelo
+    if df_clean is not None and 'Aprobado' in df_clean.columns:
+        # Entrenar modelo rápido para predicción
         numeric_features = df_clean.select_dtypes(include=[np.number]).columns.tolist()
+        exclude_features = ['Aprobado', 'Nota_final']
+        if 'Nota_promedio' in numeric_features:
+            exclude_features.append('Nota_promedio')
         
-        # Excluir columnas no relevantes
-        exclude_features = ['Aprobado']
-        for col in df_clean.columns:
-            if 'nota' in col.lower() or 'Nota' in col:
-                exclude_features.append(col)
+        features_pred = [col for col in numeric_features if col not in exclude_features]
         
-        features = [col for col in numeric_features if col not in exclude_features]
-        
-        if len(features) == 0:
-            st.error("No hay características para entrenar modelo")
+        if len(features_pred) == 0:
+            st.error("No hay características para entrenar modelo predictivo")
             st.stop()
         
-        # Entrenar modelo con todas las características disponibles
-        X = df_clean[features]
-        y = df_clean['Aprobado']
+        X_pred = df_clean[features_pred]
+        y_pred = df_clean['Aprobado']
         
-        # Verificar que tenemos datos
-        if len(X) == 0:
-            st.error("No hay datos para entrenar el modelo")
+        # Verificar que tenemos ambas clases
+        if y_pred.nunique() < 2:
+            st.error("No hay suficientes clases para entrenar modelo predictivo")
+            st.info("Ajusta el límite de aprobación en la sección 'Modelo Supervisado'")
             st.stop()
-        
-        # Estandarizar
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
         
         # Entrenar modelo
-        model = LogisticRegression(random_state=42, max_iter=1000)
-        model.fit(X_scaled, y)
+        scaler_pred = StandardScaler()
+        X_pred_scaled = scaler_pred.fit_transform(X_pred)
         
-        # Crear datos del estudiante (asegurar todas las características)
-        estudiante_data = {}
-        for feature in features:
-            if feature == 'Asistencia':
-                estudiante_data[feature] = asistencia
-            elif feature == 'Tareas_entregadas' or 'tarea' in feature.lower():
-                estudiante_data[feature] = tareas
-            elif 'participacion' in feature.lower():
-                estudiante_data[feature] = participacion
-            elif 'hora' in feature.lower() or 'estudio' in feature.lower():
-                estudiante_data[feature] = horas_estudio
-            else:
-                # Para otras características, usar la mediana
-                estudiante_data[feature] = df_clean[feature].median()
+        model_pred = LogisticRegression(random_state=42, max_iter=1000)
+        model_pred.fit(X_pred_scaled, y_pred)
         
-        estudiante_df = pd.DataFrame([estudiante_data])
+        col_input, col_result = st.columns([1, 1])
         
-        # Asegurar el mismo orden de columnas
-        estudiante_df = estudiante_df[features]
-        
-        # Estandarizar
-        estudiante_scaled = scaler.transform(estudiante_df)
-        
-        # Predecir solo cuando se presiona el botón
-        if predecir:
-            try:
-                probabilidad = model.predict_proba(estudiante_scaled)[0]
-                prediccion = model.predict(estudiante_scaled)[0]
+        with col_input:
+            st.subheader("📝 Características del Estudiante")
+            
+            # Inputs basados en características disponibles
+            inputs = {}
+            
+            if 'Asistencia' in features_pred:
+                asistencia = st.slider("Asistencia (%)", 0, 100, 85)
+                inputs['Asistencia'] = asistencia
+            
+            if 'Participacion_clase' in features_pred:
+                participacion = st.slider("Participación (0-10)", 0, 10, 7)
+                inputs['Participacion_clase'] = participacion
+            
+            # Botón para predecir
+            if st.button("🎯 Predecir Resultado", type="primary", use_container_width=True):
+                # Crear datos del estudiante
+                estudiante_data = {}
+                for feature in features_pred:
+                    if feature in inputs:
+                        estudiante_data[feature] = inputs[feature]
+                    else:
+                        estudiante_data[feature] = df_clean[feature].median()
                 
-                st.subheader("Resultado de la Predicción")
+                estudiante_df = pd.DataFrame([estudiante_data])
+                estudiante_df = estudiante_df[features_pred]
                 
-                # Mostrar resultado con estilo
-                if prediccion == 1:
-                    st.success("""
+                # Estandarizar y predecir
+                estudiante_scaled = scaler_pred.transform(estudiante_df)
+                probabilidad = model_pred.predict_proba(estudiante_scaled)[0]
+                prediccion = model_pred.predict(estudiante_scaled)[0]
+                
+                # Guardar resultados
+                st.session_state['prediccion_resultados'] = {
+                    'probabilidad': probabilidad,
+                    'prediccion': prediccion,
+                    'caracteristicas': inputs
+                }
+        
+        with col_result:
+            st.subheader("📊 Resultado de Predicción")
+            
+            if 'prediccion_resultados' in st.session_state:
+                resultados = st.session_state['prediccion_resultados']
+                
+                # Calcular probabilidades
+                prob_reprobado = resultados['probabilidad'][0] * 100
+                prob_aprobado = resultados['probabilidad'][1] * 100
+                
+                if resultados['prediccion'] == 1:
+                    st.success(f"""
                     ## ✅ **APROBADO**
                     
-                    **El estudiante tiene alta probabilidad de aprobar la asignatura.**
+                    **Probabilidad de aprobar:** {prob_aprobado:.1f}%
+                    
+                    El estudiante tiene **alta probabilidad** de aprobar.
                     """)
                     st.balloons()
                 else:
-                    st.error("""
+                    st.error(f"""
                     ## ❌ **REPROBADO**
                     
-                    **El estudiante tiene alta probabilidad de reprobar la asignatura.**
+                    **Probabilidad de reprobar:** {prob_reprobado:.1f}%
+                    
+                    El estudiante tiene **alta probabilidad** de reprobar.
                     **Se recomienda intervención inmediata.**
                     """)
                 
-                # Mostrar probabilidades
-                col_prob1, col_prob2 = st.columns(2)
-                with col_prob1:
-                    st.metric("Probabilidad de Aprobar", f"{probabilidad[1]*100:.1f}%")
-                with col_prob2:
-                    st.metric("Probabilidad de Reprobado", f"{probabilidad[0]*100:.1f}%")
-                
                 # Gráfico de probabilidades
-                fig = px.bar(x=['Reprobado', 'Aprobado'], 
-                            y=[probabilidad[0], probabilidad[1]],
-                            color=['Reprobado', 'Aprobado'],
-                            color_discrete_map={'Reprobado': '#EF553B', 'Aprobado': '#00CC96'},
-                            labels={'x': 'Resultado', 'y': 'Probabilidad'},
-                            title='Distribución de Probabilidades',
-                            text=[f'{probabilidad[0]*100:.1f}%', f'{probabilidad[1]*100:.1f}%'])
-                fig.update_traces(textposition='outside')
-                st.plotly_chart(fig, use_container_width=True)
+                fig_pred = px.bar(x=['Reprobado', 'Aprobado'], 
+                                y=[resultados['probabilidad'][0], resultados['probabilidad'][1]],
+                                color=['Reprobado', 'Aprobado'],
+                                color_discrete_map={'Reprobado': '#EF553B', 'Aprobado': '#00CC96'},
+                                labels={'x': 'Resultado', 'y': 'Probabilidad'},
+                                title='Distribución de Probabilidades',
+                                text=[f'{prob_reprobado:.1f}%', f'{prob_aprobado:.1f}%'])
+                fig_pred.update_traces(textposition='outside')
+                st.plotly_chart(fig_pred, use_container_width=True)
                 
-                # Recomendaciones basadas en predicción
+                # Recomendaciones
                 st.subheader("📋 Recomendaciones")
                 
-                if prediccion == 0:  # Si predice reprobado
+                if resultados['prediccion'] == 0:
                     st.warning("""
-                    **Acciones recomendadas:**
+                    **🔴 ACCIONES RECOMENDADAS (URGENTE):**
                     
-                    1. **Revisar asistencia**: Asegurar mínimo 80% de asistencia
-                    2. **Entrega de tareas**: Completar todas las asignaciones pendientes
-                    3. **Tutorías**: Solicitar sesiones de refuerzo con el docente
-                    4. **Horas de estudio**: Incrementar a mínimo 15 horas semanales
-                    5. **Seguimiento**: Programar evaluación de progreso en 2 semanas
+                    1. **📅 Revisar asistencia** - Asegurar mínimo 80% de asistencia
+                    2. **📚 Entrega de tareas** - Completar asignaciones pendientes
+                    3. **👨‍🏫 Tutorías** - Solicitar sesiones de refuerzo inmediatas
+                    4. **⏰ Horas de estudio** - Incrementar horas de estudio
+                    5. **📊 Seguimiento** - Evaluación de progreso en 2 semanas
                     """)
                 else:
                     st.info("""
-                    **Acciones de mantenimiento:**
+                    **🟢 ACCIONES DE MANTENIMIENTO:**
                     
-                    1. **Continuar con buen desempeño**: Mantener hábitos de estudio
-                    2. **Participación activa**: Seguir participando en clases
-                    3. **Ayuda a compañeros**: Ofrecer apoyo a estudiantes con dificultades
-                    4. **Explorar profundización**: Buscar temas avanzados de interés
+                    1. **✅ Continuar buen desempeño** - Mantener hábitos de estudio
+                    2. **💬 Participación activa** - Seguir participando en clases
+                    3. **🤝 Ayuda a compañeros** - Ofrecer apoyo a estudiantes
+                    4. **🎯 Explorar profundización** - Buscar temas avanzados
                     """)
-                
-                # Factores de influencia
-                if hasattr(model, 'coef_'):
-                    importancia = np.abs(model.coef_[0])
-                    idx_importante = np.argmax(importancia)
-                    variable_importante = features[idx_importante]
-                    
-                    st.info(f"""
-                    **Factor más influyente en la predicción:**
-                    ### **{variable_importante}**
-                    
-                    Mejorar en esta variable aumentaría significativamente 
-                    las probabilidades de aprobar.
-                    """)
-            
-            except Exception as e:
-                st.error(f"❌ Error al realizar predicción: {str(e)}")
-        
-        else:
-            # Mostrar placeholder cuando no se ha presionado el botón
-            st.subheader("Resultado de la Predicción")
-            st.info("👈 Ajusta las características del estudiante y presiona 'Predecir Resultado'")
-            
-            # Mostrar valores actuales
-            st.write("**Valores actuales:**")
-            st.write(f"- Asistencia: {asistencia}%")
-            st.write(f"- Tareas entregadas: {tareas}")
-            st.write(f"- Participación: {participacion}/10")
-            st.write(f"- Horas de estudio: {horas_estudio} horas/semana")
+            else:
+                st.info("👈 Ajusta las características y presiona 'Predecir Resultado'")
+    else:
+        st.error("No hay datos preparados para predicción")
 
 # ============================================================================
 # PIE DE PÁGINA
@@ -842,23 +926,9 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: gray;'>
-    <p>📚 Práctica de Aprendizaje Automático - Modelos Supervisado y No Supervisado</p>
-    <p>🎓 Análisis Predictivo del Rendimiento Académico</p>
+    <p>📚 <b>Práctica de Aprendizaje Automático</b> - Modelos Supervisado y No Supervisado</p>
+    <p>🎓 <b>Análisis Predictivo del Rendimiento Académico</b></p>
     <p>⚙️ Desarrollado con Python, Scikit-learn y Streamlit</p>
+    <p>📅 Diciembre 2025</p>
 </div>
 """, unsafe_allow_html=True)
-
-# Debug info en sidebar (solo en desarrollo)
-debug_mode = st.sidebar.checkbox("Modo debug", value=False)
-if debug_mode:
-    st.sidebar.write("### Debug Info")
-    st.sidebar.write(f"Sección actual: {section}")
-    st.sidebar.write(f"Tamaño dataset original: {df.shape if 'df' in locals() else 'N/A'}")
-    st.sidebar.write(f"Tamaño dataset limpio: {df_clean.shape if 'df_clean' in locals() else 'N/A'}")
-    
-    if 'df_clean' in locals():
-        st.sidebar.write("Columnas df_clean:", list(df_clean.columns))
-        
-        if 'Aprobado' in df_clean.columns:
-            st.sidebar.write("Distribución de Aprobado:")
-            st.sidebar.write(df_clean['Aprobado'].value_counts())
